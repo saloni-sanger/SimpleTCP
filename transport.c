@@ -104,32 +104,41 @@ static void control_loop(mysocket_t sd, context_t *ctx);
 void initBuffers(context_t*);
 int min(int, int);
 
-//3 way handshake, we request connection
-tcphdr* createSYN(tcp_seq, tcp_seq);
-bool sendSYN(mysocket_t, context_t*); // request for connection from transport layer to application layer
-void waitSYNACK(mysocket_t, context_t*); // application ACKs sync request
-tcphdr* createACK(tcp_seq, tcp_seq); 
-bool sendACK(mysocket_t, context_t*); //ACK the reciever's SYN, connected
+tcphdr* createHandshakePacket(tcp_seq, tcp_seq, uint8_t);
+bool sendHandshakePacket(mysocket_t, context_t*, tcp_seq, tcp_seq, uint8_t);
+void waitHandshakePacket(mysocket_t, context_t*);
+
+// 3 way handshake, we request connection
+// create SYN
+// send SYN request for connection from transport layer to application layer
+// wait SYNACK
+// create ACK
+// send ACK the reciever's SYN, connected
 
 //3 way handshake, they request connection, connection can go both ways
-void waitSYN(mysocket_t, context_t*); //application layer requests to connect
-tcphdr* createSYNACK(tcp_seq, tcp_seq);
-bool sendSYNACK(mysocket_t, context_t*); //send SYNACK to acknowledge the SYN and also SYN back
-void waitACK(mysocket_t, context_t*);
+// wait SYN
+// createSYNACK
+// send SYNACK to acknowledge the SYN and also SYN back
+// wait ACK
 
 //application requests data, create and send packet
-void applEvent(mysocket_t, context_t*);
+void applEvent(mysocket_t, context_t*); //event meaning application sends us a packet
 tcphdr* createPacket(tcp_seq, tcp_seq, char*, size_t);
 bool netwSend(mysocket_t, context_t*, char*, size_t);
-void netwEvent(mysocket_t, context_t*);
+void netwEvent(mysocket_t, context_t*); //event meaning network sends us a packet
 void applSend(mysocket_t, context_t*, char*, size_t);
 
 //recieving packet
 void parsePacket(context_t*, char*, bool&, bool&); //bool used to check if FIN or duplicate
 
+//NOT CLOSING RIGHT
+/*
+free(): double free detected in tcache 2
+Aborted (core dumped)
+*/
 //closing connection if we recieve packet with FIN
-tcphdr* createFIN(tcp_seq, tcp_seq);
-bool sendFIN(mysocket_t, context_t*);
+//create FIN
+// send FIN
 void applClose(mysocket_t, context_t*);
 
 //testing
@@ -156,13 +165,13 @@ void transport_init(mysocket_t sd, bool_t is_active)
      * ECONNREFUSED, etc.) before calling the function.
      */
     if (is_active) { //client = active, client should initiate a connection
-        if (!sendSYN(sd, ctx)) { errno = ECONNREFUSED; }
-        waitSYNACK(sd, ctx);
-        if (!sendACK(sd, ctx)) { errno = ECONNREFUSED; }
+        if (!sendHandshakePacket(sd, ctx, ctx->seqNum, 0, TH_SYN)) { errno = ECONNREFUSED; }
+        waitHandshakePacket(sd, ctx);
+        if (!sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, TH_ACK)) { errno = ECONNREFUSED; }
     } else { //server = passive, shoud listen for connection
-        waitSYN(sd, ctx);
-        if (!sendSYNACK(sd, ctx)) { errno = ECONNREFUSED; }
-        waitACK(sd, ctx);
+        waitHandshakePacket(sd, ctx);
+        if (!sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, (TH_SYN | TH_ACK))) { errno = ECONNREFUSED; }
+        waitHandshakePacket(sd, ctx);
     }
 
     ctx->connection_state = CSTATE_ESTABLISHED;
@@ -240,36 +249,60 @@ static void control_loop(mysocket_t sd, context_t *ctx)
     }
 }
 
-tcphdr* createSYN(tcp_seq seqNum, tcp_seq ackNum) {
-    tcphdr* SYN = (tcphdr*) malloc(sizeof(tcphdr)); //create memory for header of SYN packet
-    SYN->th_seq = htonl(seqNum);
-    SYN->th_ack = htonl(ackNum);
-    SYN->th_off = htons(5); //data begins 20 bytes into the packet
-    SYN->th_flags = TH_SYN; //packet type SYN
-    SYN->th_win = htons(WINDOW_SIZE); //amount of data we (the sender) are willing to accept
-    return SYN;
+tcphdr* createHandshakePacket(tcp_seq seqNum, tcp_seq ackNum, uint8_t flags) {
+    tcphdr* packet = (tcphdr*) malloc(sizeof(tcphdr)); //create memory for header of SYN packet
+    packet->th_seq = htonl(seqNum);
+    packet->th_ack = htonl(ackNum);
+    packet->th_off = htons(5); //data begins 20 bytes into the packet
+    packet->th_flags = flags; //packet type
+    packet->th_win = htons(WINDOW_SIZE); //amount of data we (the sender) are willing to accept
+    return packet;
 }
 
-bool sendSYN(mysocket_t sd, context_t* ctx) {
-    //create packet
-    tcphdr* SYN = createSYN(ctx->seqNum, 0);
+tcphdr* createPacket(tcp_seq seqNum, tcp_seq ackNum, char* payload, size_t pSize) {
+    unsigned int packetSize = sizeof(tcphdr) + pSize;
+    tcphdr* packet = (tcphdr*)malloc(packetSize);
+
+    packet->th_seq = htonl(seqNum);
+    packet->th_ack = htonl(ackNum);
+    packet->th_off = htons(5); //data begins 20 bytes into the packet
+    packet->th_flags = NETWORK_DATA; //packet type
+    packet->th_win = htons(WINDOW_SIZE); //amount of data we (the sender) are willing to accept
+    
+    //append payload to header
+    memcpy((char*)packet + sizeof(tcphdr), payload, pSize); //1: destination, beginning of packet offset by header, 2: source payload, 3: size
+    return packet;
+}
+
+
+//generic sendHandshakePacket(mysocket_t sd, context_t* ctx, tcp_seq seqNum, tcp_seq ackNum, uint8_t flags)
+bool sendHandshakePacket(mysocket_t sd, context_t* ctx, tcp_seq seqNum, tcp_seq ackNum, uint8_t flags) {
+    tcphdr* packet = createHandshakePacket(seqNum, ackNum, flags); //create
     ctx->seqNum++; //increase sequence number after packet creation
 
-    //send packet
-    ssize_t bytes_sent = stcp_network_send(sd, SYN, sizeof(tcphdr), NULL); //packet is data to be sent, and the packet has no body so it has header length (20 bytes)
+    //send
+    ssize_t bytes_sent = stcp_network_send(sd, packet, sizeof(tcphdr), NULL); //packet is data to be sent, and the packet has no body so it has header length (20 bytes)
 
     if(bytes_sent > 0) { //successful send
-        ctx->connection_state = SYN_SENT;
-        free(SYN);
+        //change state if necessary
+        if (flags == TH_SYN) {
+            ctx->connection_state = SYN_SENT;
+        } else if (flags == (TH_SYN | TH_ACK)) {
+            ctx->connection_state = SYN_ACK_SENT;
+        } else if (flags == TH_FIN) {
+            ctx->connection_state = FIN_SENT;
+            waitHandshakePacket(sd, ctx);
+        }
+        free(packet);
         return true;
     } else { //error with network send
-        free(SYN);
+        free(packet);
         free(ctx);
         return false;
     }
 }
 
-void waitSYNACK(mysocket_t sd, context_t* ctx) {
+void waitHandshakePacket(mysocket_t sd, context_t* ctx) {
     char buf[sizeof(tcphdr)];
     stcp_wait_for_event(sd, NETWORK_DATA, NULL); //hold until network data event recieved
     ssize_t bytes_recvd = stcp_network_recv(sd, buf, MSS); //limit data recieved into buffer to MaxSegementSize
@@ -281,105 +314,19 @@ void waitSYNACK(mysocket_t sd, context_t* ctx) {
     //parse recieved data
     tcphdr* packet = (tcphdr*)buf;
 
-    if (packet->th_flags == (TH_ACK | TH_SYN)) { //if flags are SYN and ACK OR'd together (format of th_flags)
+    //extract packet flags once
+    uint8_t flags = packet->th_flags;
+    //common to all types of handshake packets
+    if (flags == TH_SYN || flags == (TH_ACK | TH_SYN) || flags == TH_ACK) {
         ctx->recv_seqNum = ntohl(packet->th_seq);
         ctx->recv_windowSize = ntohs(packet->th_win) > 0 ? ntohs(packet->th_win) : 1; //default size 1 if invalid window size entered
-        ctx->connection_state = SYN_ACK_RECEIVED;
     }
-}
 
-tcphdr* createACK(tcp_seq seqNum, tcp_seq ackNum) {
-    tcphdr* ACK = (tcphdr*) malloc(sizeof(tcphdr)); //create memory for header of SYN packet
-    ACK->th_seq = htonl(seqNum);
-    ACK->th_ack = htonl(ackNum);
-    ACK->th_off = htons(5); //data begins 20 bytes into the packet
-    ACK->th_flags = TH_ACK; //packet type SYN
-    ACK->th_win = htons(WINDOW_SIZE); //amount of data we (the sender) are willing to accept
-    return ACK;
-}
-
-bool sendACK(mysocket_t sd, context_t* ctx) {
-    //create packet
-    tcphdr* ACK = createACK(ctx->seqNum, ctx->recv_seqNum + 1); //sender's sequence number for packet ordering, then acknowledgment number to show the packet we are acknowledging
-    ctx->seqNum++;
-
-    //send packet
-    ssize_t bytes_sent = stcp_network_send(sd, ACK, sizeof(tcphdr), NULL); //packet is data to be sent, and the packet has no body so it has header length (20 bytes)
-
-    if(bytes_sent > 0) { //successful send
-        free(ACK);
-        return true;
-    } else { //error with network send
-        free(ACK);
-        free(ctx);
-        return false;
-    }
-}
-
-void waitSYN(mysocket_t sd, context_t* ctx) { //imporvement is to make general wait, create, send functions
-    char buf[sizeof(tcphdr)];
-    stcp_wait_for_event(sd, NETWORK_DATA, NULL); //hold until network data event recieved
-    ssize_t bytes_recvd = stcp_network_recv(sd, buf, MSS); //limit data recieved into buffer
-    if (bytes_recvd < sizeof(tcphdr)) {
-        free(ctx);
-        errno = ECONNREFUSED;
-        return;
-    }
-    //parse recieved data
-    tcphdr* packet = (tcphdr*)buf;
-
-    if (packet->th_flags == TH_SYN) { //if only SYN flag
-        ctx->recv_seqNum = ntohl(packet->th_seq);
-        ctx->recv_windowSize = ntohs(packet->th_win) > 0 ? ntohs(packet->th_win) : 1; //default size 1 if invalid window size entered
+    if (flags == TH_SYN) { //if only SYN flag
         ctx->connection_state = SYN_RECEIVED;
-    }
-}
-
-tcphdr* createSYNACK(tcp_seq seqNum, tcp_seq ackNum) {
-    tcphdr* SYNACK = (tcphdr*) malloc(sizeof(tcphdr)); //create memory for header of SYN packet
-    SYNACK->th_seq = htonl(seqNum);
-    SYNACK->th_ack = htonl(ackNum);
-    SYNACK->th_off = htons(5); //data begins 20 bytes into the packet
-    SYNACK->th_flags = (TH_SYN | TH_ACK); //packet type SYN and ACK
-    SYNACK->th_win = htons(WINDOW_SIZE); //amount of data we (the sender) are willing to accept
-    return SYNACK;
-}
-
-bool sendSYNACK(mysocket_t sd, context_t* ctx) {
-    //create packet
-    tcphdr* SYNACK = createSYNACK(ctx->seqNum, ctx->recv_seqNum + 1); //sender's sequence number for packet ordering, then acknowledgment number to show the packet we are acknowledging
-    ctx->seqNum++;
-
-    //send packet
-    ssize_t bytes_sent = stcp_network_send(sd, SYNACK, sizeof(tcphdr), NULL); //packet is data to be sent, and the packet has no body so it has header length (20 bytes)
-
-    if(bytes_sent > 0) { //successful send
-        ctx->connection_state = SYN_ACK_SENT;
-        free(SYNACK);
-        return true;
-    } else { //error with network send
-        free(SYNACK);
-        free(ctx);
-        return false;
-    }
-}
-
-void waitACK(mysocket_t sd, context_t* ctx) {
-    char buf[sizeof(tcphdr)];
-    unsigned int event = stcp_wait_for_event(sd, NETWORK_DATA, NULL); //hold until network data event recieved
-    ssize_t bytes_recvd = stcp_network_recv(sd, buf, MSS); //limit data recieved into buffer
-    if (bytes_recvd < sizeof(tcphdr)) {
-        free(ctx);
-        errno = ECONNREFUSED;
-        return;
-    }
-    //parse recieved data
-    tcphdr* packet = (tcphdr*)buf;
-
-    if (packet->th_flags == TH_ACK) { //if flags are SYN and ACK OR'd together (format of th_flags)
-        ctx->recv_seqNum = ntohl(packet->th_seq);
-        ctx->recv_windowSize = ntohs(packet->th_win) > 0 ? ntohs(packet->th_win) : 1; //default size 1 if invalid window size entered
+    } else if (flags == (TH_ACK | TH_SYN)) { //if flags are SYN and ACK OR'd together (format of th_flags)
         ctx->connection_state = SYN_ACK_RECEIVED;
+    } else if (flags == TH_ACK) { //if only ACK flag
         if (ctx->connection_state == FIN_SENT) {
             ctx->connection_state = CSTATE_CLOSED;
         }
@@ -403,48 +350,17 @@ void applEvent(mysocket_t sd, context_t* ctx) { //TCP recieves write(payload), s
     }
 
     netwSend(sd, ctx, payload, appl_bytes_recvd);
-    waitACK(sd, ctx);
+    waitHandshakePacket(sd, ctx); //wait for ACK
 }
 
 void applClose(mysocket_t sd, context_t* ctx) {
     if (ctx->connection_state == CSTATE_ESTABLISHED) {
-        sendFIN(sd, ctx);
+        sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, TH_FIN);
     }
 
     /* state test
     printf("connection_state: %d\n", ctx->connection_state);
     */
-}
-
-tcphdr* createFIN(tcp_seq seqNum, tcp_seq ackNum) {
-    tcphdr* FIN = (tcphdr*) malloc(sizeof(tcphdr)); //create memory for header of SYN packet
-    FIN->th_seq = htonl(seqNum);
-    FIN->th_ack = htonl(ackNum);
-    FIN->th_off = htons(5); //data begins 20 bytes into the packet
-    FIN->th_flags = TH_FIN; //packet type SYN
-    FIN->th_win = htons(WINDOW_SIZE); //amount of data we (the sender) are willing to accept
-    return FIN;
-}
-
-bool sendFIN(mysocket_t sd, context_t* ctx) {
-    //create packet
-    tcphdr* FIN = createFIN(ctx->seqNum, ctx->recv_seqNum + 1); //sender's sequence number for packet ordering, then acknowledgment number to show the packet we are acknowledging
-    ctx->seqNum++;
-
-    //send packet
-    ssize_t bytes_sent = stcp_network_send(sd, FIN, sizeof(tcphdr), NULL); //packet is data to be sent, and the packet has no body so it has header length (20 bytes)
-
-    if(bytes_sent > 0) { //successful send
-        ctx->connection_state = FIN_SENT;
-        waitACK(sd, ctx);
-
-        free(FIN);
-        return true;
-    } else { //error with network send
-        free(FIN);
-        free(ctx);
-        return false;
-    }
 }
 
 void netwEvent(mysocket_t sd, context_t* ctx) { 
@@ -460,19 +376,19 @@ void netwEvent(mysocket_t sd, context_t* ctx) {
     }
     if(isFIN) {
         clock_gettime(CLOCK_REALTIME, &spec);
-        sendACK(sd, ctx);
+        sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, TH_ACK);
         stcp_fin_received(sd);
         ctx->connection_state = CSTATE_CLOSED;
         return;
     }
     parsePacket(ctx, payload, isFIN, isDUP);
     if(isDUP) {
-        sendACK(sd, ctx);
+        sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, TH_ACK);
         return;
     }
     if(bytes_recvd - sizeof(tcphdr)) { //data present
         applSend(sd, ctx, payload, bytes_recvd); //send payload to application
-        sendACK(sd, ctx);
+        sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, TH_ACK);
     }
 }
 
@@ -488,21 +404,6 @@ void parsePacket(context_t* ctx, char* payload, bool& isFIN, bool& isDUP) {
     if (header->th_flags == TH_FIN) {
         isFIN = true;
     }
-}
-
-tcphdr* createPacket(tcp_seq seqNum, tcp_seq ackNum, char* payload, size_t pSize) {
-    unsigned int packetSize = sizeof(tcphdr) + pSize;
-    tcphdr* packet = (tcphdr*)malloc(packetSize);
-
-    packet->th_seq = htonl(seqNum);
-    packet->th_ack = htonl(ackNum);
-    packet->th_off = htons(5); //data begins 20 bytes into the packet
-    packet->th_flags = NETWORK_DATA; //packet type
-    packet->th_win = htons(WINDOW_SIZE); //amount of data we (the sender) are willing to accept
-    
-    //append payload to header
-    memcpy((char*)packet + sizeof(tcphdr), payload, pSize); //1: destination, beginning of packet offset by header, 2: source payload, 3: size
-    return packet;
 }
 
 bool netwSend(mysocket_t sd, context_t* ctx, char* payload, size_t pSize) {
@@ -552,6 +453,3 @@ void our_dprintf(const char *format,...)
     fputs(buffer, stdout);
     fflush(stdout);
 }
-
-
-
