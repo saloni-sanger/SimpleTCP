@@ -37,13 +37,10 @@
 
 //headers added by me
 #include <errno.h>
-#include <time.h>
 
 //my constants
 const uint16_t WINDOW_SIZE = 3072; //local recieve window, congestion window, send = min_size(local recieve, congestion) of OTHER SIDE's windows
 const unsigned int MSS = 536; //max segment size = 536 bytes
-
-struct timespec spec;
 
 //TCP states ------------ change names
 enum { 
@@ -108,19 +105,6 @@ tcphdr* createHandshakePacket(tcp_seq, tcp_seq, uint8_t);
 bool sendHandshakePacket(mysocket_t, context_t*, tcp_seq, tcp_seq, uint8_t);
 void waitHandshakePacket(mysocket_t, context_t*);
 
-// 3 way handshake, we request connection
-// create SYN
-// send SYN request for connection from transport layer to application layer
-// wait SYNACK
-// create ACK
-// send ACK the reciever's SYN, connected
-
-//3 way handshake, they request connection, connection can go both ways
-// wait SYN
-// createSYNACK
-// send SYNACK to acknowledge the SYN and also SYN back
-// wait ACK
-
 //application requests data, create and send packet
 void applEvent(mysocket_t, context_t*); //event meaning application sends us a packet
 tcphdr* createPacket(tcp_seq, tcp_seq, char*, size_t);
@@ -164,14 +148,16 @@ void transport_init(mysocket_t sd, bool_t is_active)
      * if connection fails; to do so, just set errno appropriately (e.g. to
      * ECONNREFUSED, etc.) before calling the function.
      */
+
+    // 3 way handshake, we request connection
     if (is_active) { //client = active, client should initiate a connection
-        if (!sendHandshakePacket(sd, ctx, ctx->seqNum, 0, TH_SYN)) { errno = ECONNREFUSED; }
-        waitHandshakePacket(sd, ctx);
-        if (!sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, TH_ACK)) { errno = ECONNREFUSED; }
-    } else { //server = passive, shoud listen for connection
-        waitHandshakePacket(sd, ctx);
-        if (!sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, (TH_SYN | TH_ACK))) { errno = ECONNREFUSED; }
-        waitHandshakePacket(sd, ctx);
+        if (!sendHandshakePacket(sd, ctx, ctx->seqNum, 0, TH_SYN)) { errno = ECONNREFUSED; } //send SYN
+        waitHandshakePacket(sd, ctx); //wait SYNACK
+        if (!sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, TH_ACK)) { errno = ECONNREFUSED; } //send ACK
+    } else { //server = passive, shoud listen for connection; they request connection, connection can go both ways
+        waitHandshakePacket(sd, ctx); //wait SYN
+        if (!sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, (TH_SYN | TH_ACK))) { errno = ECONNREFUSED; } //send SYNACK
+        waitHandshakePacket(sd, ctx); //wait ACK
     }
 
     ctx->connection_state = CSTATE_ESTABLISHED;
@@ -180,7 +166,7 @@ void transport_init(mysocket_t sd, bool_t is_active)
     control_loop(sd, ctx);
 
     /* do any cleanup here */
-    free(ctx);
+    free(ctx); //this is causing the double free issue
 }
 
 
@@ -196,7 +182,6 @@ static void generate_initial_seq_num(context_t *ctx)
 #else
     /* you have to fill this up */
     /*ctx->initial_sequence_num =;*/
-    srand(time(NULL));
     ctx->seqNum = rand() % MAX_SEQNUM + 1;
 #endif
 }
@@ -232,18 +217,15 @@ static void control_loop(mysocket_t sd, context_t *ctx)
         {
             /* the application has requested that data be sent */
             /* see stcp_app_recv() */
-            clock_gettime(CLOCK_REALTIME, &spec);
             applEvent(sd, ctx);
         }
 
         /* etc. */
         if (event & NETWORK_DATA) {
-            clock_gettime(CLOCK_REALTIME, &spec);
             netwEvent(sd, ctx);
         }
 
         if (event & APP_CLOSE_REQUESTED) {
-            clock_gettime(CLOCK_REALTIME, &spec);
             applClose(sd, ctx);
         }
     }
@@ -375,7 +357,6 @@ void netwEvent(mysocket_t sd, context_t* ctx) {
         return;
     }
     if(isFIN) {
-        clock_gettime(CLOCK_REALTIME, &spec);
         sendHandshakePacket(sd, ctx, ctx->seqNum, ctx->recv_seqNum + 1, TH_ACK);
         stcp_fin_received(sd);
         ctx->connection_state = CSTATE_CLOSED;
