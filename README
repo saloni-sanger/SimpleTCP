@@ -1,6 +1,37 @@
 ================================================
  README file for Project 3 - Simple TCP
-           Name(s): 
+           Name(s): Saloni Sanger
 ================================================
 
-DESCRIBE YOUR CODE AND DESIGN DECISIONS HERE
+Files written: transport.c, README
+
+##### Background:
+STCP provides a connection-oriented, in-order, full duplex 
+end-to-end delivery mechanism.
+We assume the network is reliable, and therefore do not account 
+for dropped packets, reordering, retransmissions, and timeouts in 
+the underlying network layer.
+
+##### Design Decisions:
+1. Not all possible states were enumerated.
+For example, I chose not to have an ACK_SENT state.
+I found that there was no use in having more states than necessary
+to do our basic functionality, so I didn't bother wasting lines on
+something that could be easily added later.
+
+I also chose to have multiple states during the setup process 
+(SYN_SENT, SYN_RECEIVED, SYN_ACK_SENT, SYN_ACK_RECEIVED)
+instead of one called CSTATE_ESTABLISHING.
+This made it easier to track what calls had gone through properly,
+and keeps the code readable.
+
+2. Recieve and Send Buffer structs hold Segment struct
+3. context_t tracks state, sequence numbers, reciever window size, and buffers.
+
+##### Strengths:
+1. Generic functions for handshake packet creation, sending, and waiting.
+2. Buffers have sliding window.
+
+##### Weaknesses:
+1. double free() at connection close.
+2. No check to set isDUP upon packet reciept.
